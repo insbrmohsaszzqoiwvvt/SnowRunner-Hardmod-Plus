@@ -21,6 +21,11 @@
       едет вместе с машиной, цвет - как у строки в окне), «Ремонт» меняет это
       колесо на запасное (одно колесо из источника). Первая цифра «Колёса»
       окрашена по худшему колесу.
+  cargo_loading_price - цена автоматической погрузки (там, где она платная: Сложный
+      режим, NG+ с платной погрузкой) зависит от груза: заданная цена за каждый
+      слот груза, у брёвен вместо числа слотов - свой множитель для коротких,
+      средних (и сожжённых) и длинных. Множитель цены погрузки NG+ по-прежнему
+      применяется.
 
 В сетевой игре (кооператив) патчи окна ремонта ничего не меняют.
 
@@ -36,7 +41,7 @@ from sslpatch import (PatchError, ModEditor, Local, THIS, Int, Bool, NULL, Const
                       Goto, Return, ReturnVoid, FunctionPatch, Ins, Jmp, Label, newlabel, find_one,
                       find_all, ensure_member, ensure_global, member_slot, compile_block, import_type,
                       Cast, FAdd, FSub, FMul, FLt, FGt, FGe, Concat, Delegate, Subscribe, Unsubscribe, DictGet,
-                      DictSet)
+                      DictSet, Mul, Div, RawExpr)
 
 REPAIR = "ui.components.popups.repair.popup_repair_ui_controller_new"
 REPAIR_VIEW = "ui.components.popups.repair.popup_repair_ui_view_new"
@@ -63,9 +68,11 @@ POPUP_LIB = "ui.autogen_libs.ui_popup_lib"
 DAMAGE_HANDLER = "game.truck_damage_handler"
 TEXT_COLORS = "ui.ui_system.ui_text_colors"
 COLOR = "math.color"
+CARGO_LOADING = "ui.components.popups.cargo.popup_cargo_loading_ui_controller"
 
 WHEEL_KEY = "repair_single_wheel"
-KEYS = ("repair_from_nearby", "repair_parts_transfer", "winch_unpack_cargo", WHEEL_KEY)
+LOADING_KEY = "cargo_loading_price"
+KEYS = ("repair_from_nearby", "repair_parts_transfer", "winch_unpack_cargo", WHEEL_KEY, LOADING_KEY)
 
 # строка-метка в изменённых модулях: по ней видно, что initial.pak уже пропатчен
 MARKER = "hard_mode_plus_service_patch"
@@ -99,10 +106,18 @@ ARROW_SHIFT_Y = -0.227
 # новые поля данных окна (PopupRepairUiViewData2)
 F_ORDER, F_PREV, F_NEXT = "hmpWheelOrder", "hmpPrevArrow", "hmpNextArrow"
 
-# модули, которые читаются (изменяются REPAIR, REPAIR_VIEW, HUD и DAMAGE)
+# погрузка: цена за слот груза по умолчанию (как цена погрузки в Сложном режиме игры) и
+# множители брёвен по умолчанию; значение настройки - (цена, {вид брёвен: множитель в %})
+LOADING_DEFAULT = 150
+LOGS_DEFAULT = {"short": 1, "medium": 2, "long": 3}
+LOGS_TYPES = {"CargoLogsShort": "short", "CargoLogsMedium": "medium",
+              "CargoLogsMedium_Burnt": "medium", "CargoLogsLong": "long"}
+LOADING_VALUE = (LOADING_DEFAULT, {k: v * 100 for k, v in LOGS_DEFAULT.items()})
+
+# модули, которые читаются (изменяются REPAIR, REPAIR_VIEW, HUD, DAMAGE и CARGO_LOADING)
 ALL_MODULES = {REPAIR, REPAIR_VIEW, HUD, TRUCK, ADDON, SESSION, TRUCKS_MANAGER, DAMAGE, HUD_LIB, GFX,
                GFX_LIST, LIST_ADAPTER, INPUT_SCREEN, INPUT_EVENT, MARKERS, TRANSFORM, VEC3, VEC2, FUTURE, NET_HEALTH,
-               DAMAGE_HUD, POPUP_LIB, DAMAGE_HANDLER, TEXT_COLORS, COLOR}
+               DAMAGE_HUD, POPUP_LIB, DAMAGE_HANDLER, TEXT_COLORS, COLOR, CARGO_LOADING}
 
 
 class Sym:
@@ -1407,6 +1422,62 @@ def apply_hud(ed, enabled):
         h.set_func_code(fi, fp.build())
 
 # ---------------------------------------------------------------------------
+# окно погрузки
+
+
+def apply_cargo_loading(ed, value):
+    price, logs_pct = value
+    m = ed[CARGO_LOADING]
+    C = "PopupCargoLoadingUiController"
+    base = member_slot(m, C, "autoLoadPrice")
+    info = member_slot(m, C, "currentCargoInfo")
+    get_view = member_slot(m, C, "GetView")
+    get_price = ext_slot(m, "GetAutoloadPrice")
+    cargo = ext_slot(m, "cargo", "PopupCargoInfo")
+    ctype = ext_slot(m, "type", "Cargo")
+    slots = ext_slot(m, "slotLength", "Cargo")
+    set_price = ext_slot(m, "SetPriceForAutoLoading")
+    get_money = ext_slot(m, "GetMoney")
+    add_money = ext_slot(m, "AddMoney")
+
+    # InitContent: autoLoadPrice = GetAutoloadPrice() * GetLoadingPriceFactor()  ->
+    # (GetAutoloadPrice() > 0 ? цена из настроек : 0) * GetLoadingPriceFactor() - цена слота
+    fi = m.func_index("InitContent", C)
+    fp = FunctionPatch(m.func_code(fi))
+    at = find_one(fp.code, "01:1 01:1 01:1 08:0 04:0 0d:* 04:0 0d:* 04:0 0d:%d 07:* 27:0 07:0 3c:%d"
+                  % (get_price, base), "cargo/base-price")
+    vanilla = RawExpr(Ins(op, a) for op, a in fp.code[at:at + 10])
+    fp.replace(at, at + 10, Cond(Gt(vanilla, Int(0)), Int(price), Int(0)).emit())
+    m.set_func_code(fi, fp.build())
+
+    def cargo_price(fi):
+        """autoLoadPrice * множитель% / 100 для currentCargoInfo.cargo: у брёвен - множитель
+        их вида, у остальных грузов - число слотов (не меньше 1)"""
+        c = Field(Field(THIS, info), cargo)
+        n = Field(c, slots)
+        pct = Mul(Cond(Gt(n, Int(0)), n, Int(1)), Int(100))
+        for t, kind in sorted(LOGS_TYPES.items(), reverse=True):
+            pct = Cond(Eq(Field(c, ctype), Const(m.const_string(fi, t))), Int(logs_pct[kind]), pct)
+        return Div(Mul(Field(THIS, base), pct), Int(100)).emit()
+
+    # TryShowCargoPreview: цена на кнопке погрузки и проверка «не хватает денег»
+    fi = m.func_index("TryShowCargoPreview", C)
+    fp = FunctionPatch(m.func_code(fi))
+    at = find_one(fp.code, "07:0 0a:%d 01:1 07:0 04:0 0d:%d 04:1 0d:%d" % (base, get_view, set_price),
+                  "cargo/show-price")
+    fp.replace(at, at + 2, cargo_price(fi))
+    at = find_one(fp.code, "0d:%d 07:0 0a:%d 31:9" % (get_money, base), "cargo/enough-money")
+    fp.replace(at + 1, at + 3, cargo_price(fi))
+    m.set_func_code(fi, fp.build())
+
+    # Action: списание денег за погрузку
+    fi = m.func_index("Action", C)
+    fp = FunctionPatch(m.func_code(fi))
+    at = find_one(fp.code, "07:0 0a:%d 1d:0 07:0 0a:* 04:1 0d:%d" % (base, add_money), "cargo/pay")
+    fp.replace(at, at + 2, cargo_price(fi))
+    m.set_func_code(fi, fp.build())
+
+# ---------------------------------------------------------------------------
 
 
 def apply(ed, enabled):
@@ -1426,15 +1497,19 @@ def apply(ed, enabled):
     if "repair_from_nearby" in enabled or "winch_unpack_cargo" in enabled:
         apply_hud(ed, enabled)
         changed.add(HUD)
+    if LOADING_KEY in enabled:
+        apply_cargo_loading(ed, enabled[LOADING_KEY])
+        changed.add(CARGO_LOADING)
     for n in changed:
         ed[n].string(MARKER)
     return changed
 
 
 def is_patched(ed):
-    return any(MARKER in ed[n].strings for n in (REPAIR, REPAIR_VIEW, HUD, DAMAGE) if n in ed)
+    return any(MARKER in ed[n].strings for n in (REPAIR, REPAIR_VIEW, HUD, DAMAGE, CARGO_LOADING) if n in ed)
 
 
 def check(ed):
     """проверка, что все места правок находятся (на копиях модулей)"""
-    apply({k: ModEditor(v.blob(), v.name) for k, v in ed.items()}, {k: True for k in KEYS})
+    apply({k: ModEditor(v.blob(), v.name) for k, v in ed.items()},
+          {k: LOADING_VALUE if k == LOADING_KEY else True for k in KEYS})

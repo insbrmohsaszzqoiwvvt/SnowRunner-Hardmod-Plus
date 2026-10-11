@@ -22,11 +22,14 @@
                      которую зацеплена лебёдка текущей машины.
   repair_single_wheel - замена отдельного колеса в окне ремонта: стрелки у строки
                      «Колёса» перебирают колёса машины, «Ремонт» меняет выбранное.
+  cargo_loading_price - цена автоматической погрузки за каждый слот груза; у брёвен
+                     вместо числа слотов множители cargo_loading_logs_short/medium/long
+                     (короткие/средние/длинные). Действует там, где погрузка платная.
 
 Правки делаются в скомпилированном байткоде ([ssl_cache]/initial_*.sslbundle
 внутри initial.pak). Патченый файл всегда собирается из оригинала, поэтому
 патчи можно включать, выключать и менять их значения в любом сочетании.
-Последние четыре патча собираются из кода в service_patches.py с помощью
+Последние пять патчей собираются из кода в service_patches.py с помощью
 библиотеки sslpatch.py (оба файла должны лежать рядом с этим скриптом).
 
 Папка игры задаётся в settings.ini рядом со скриптом. Сейвы не трогаются.
@@ -508,6 +511,29 @@ def parse_value(cfg, key):
             return False, None, "%s за испытания: как в игре (x1)" % what
         g = math.gcd(n, 100) or 100
         return True, (n // g, 100 // g), "%s за испытания: x%s" % (what, "%g" % (n / 100))
+    if key == SERVICE.LOADING_KEY:
+        if raw in ("no", "false", "off"):
+            return False, None, "погрузка: цена как в игре, одна на любой груз"
+        if raw in ("yes", "true", "on"):
+            raw = str(SERVICE.LOADING_DEFAULT)
+        if not raw.isdigit() or int(raw) > 100000:
+            bad("должно быть число от 0 до 100000 (цена погрузки за слот груза) или no")
+        n = int(raw)
+        logs = {}
+        for kind, default in SERVICE.LOGS_DEFAULT.items():
+            k = "cargo_loading_logs_" + kind
+            r = cfg.get("patches", k, fallback=str(default)).split(";")[0].strip().replace(",", ".")
+            try:
+                x = float(r)
+            except ValueError:
+                x = -1
+            if not 0 <= x <= 10:
+                sys.exit("settings.ini: %s = %s - должно быть число от 0 до 10, например 2 или 1.5"
+                         % (k, r))
+            logs[kind] = round(x * 100)
+        prices = ", ".join("%s $%d" % (name, n * logs[kind] // 100) for kind, name in
+                           (("short", "короткие"), ("medium", "средние"), ("long", "длинные")))
+        return True, (n, logs), "погрузка: $%d за слот груза; брёвна: %s" % (n, prices)
     labels = {"trailer_selling": "продажа прицепов",
               "skip_bootup": "пропуск стартовой заставки",
               "garage_body_repair": "бесплатный ремонт корпуса в гараже",

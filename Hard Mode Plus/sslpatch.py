@@ -819,6 +819,8 @@ class Bin(Expr):
 
 def Add(a, b): return Bin(0x20, a, b)
 def Sub(a, b): return Bin(0x24, a, b)
+def Mul(a, b): return Bin(0x27, a, b)
+def Div(a, b): return Bin(0x2A, a, b)
 def Eq(a, b): return Bin(0x30, a, b, 7)
 def Ne(a, b): return Bin(0x30, a, b, 8)
 def Lt(a, b): return Bin(0x31, a, b, 9)
