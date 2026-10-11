@@ -33,7 +33,7 @@ from sslpatch import (PatchError, ModEditor, Local, THIS, Int, Bool, NULL, Const
                       SetLocal, SetField, Do, ArrAdd, ArrSet, If, While, Break, Continue, Block, ForEach,
                       Goto, Return, ReturnVoid, FunctionPatch, Ins, Jmp, Label, newlabel, find_one,
                       find_all, ensure_member, ensure_global, member_slot, compile_block, import_type,
-                      Cast, FAdd, FSub, FMul, FGt, FGe, Concat, Delegate, Subscribe, Unsubscribe)
+                      Cast, FAdd, FSub, FMul, FGt, FGe, Concat, Delegate, Subscribe, Unsubscribe, DictGet)
 
 REPAIR = "ui.components.popups.repair.popup_repair_ui_controller_new"
 REPAIR_VIEW = "ui.components.popups.repair.popup_repair_ui_view_new"
@@ -83,7 +83,7 @@ WHEEL_FLIP_MOUSE = 1000     # SwitchTarget(±1000) вида - стрелка м�
 WHEEL_FLIP_KEY = 2000       # SwitchTarget(±2000) - стрелка клавиатуры (только на строке колёс)
 WHEEL_MARKER_ID = "hmp_wheel_marker"
 SAME_AXLE = 0.3             # колёса ближе 0.3 м по длине машины - на одной оси
-ARROW_GAP = 4.0             # зазор между строкой и стрелкой (пиксели интерфейса)
+ARROW_SCALE = 0.6           # стрелки колёс меньше стрелок переключателя цели
 # новые поля данных окна (PopupRepairUiViewData2)
 F_ORDER, F_PREV, F_NEXT = "hmpWheelOrder", "hmpPrevArrow", "hmpNextArrow"
 
@@ -543,6 +543,10 @@ class WheelCtx:
         self.damage_ctrl = imp("GameSession", "GetDamageController", SESSION)
         self.dc_repair = imp("DamageController", "RepairPart", DAMAGE)
         self.release = imp("IngameMarkersController", "ReleaseSingleMarkerUiObject", MARKERS)
+        self.remove_obj = imp("IngameMarkersController", "RemoveObj", MARKERS)
+        self.markers = imp("IngameMarkersController", "markers", MARKERS)
+        self.marker_data = imp("MarkerUpdateData", "markerData", MARKERS)
+        self.marker_obj = imp("MarkerCreationData", "obj", MARKERS)
         self.add_obj = imp("IngameMarkersController", "AddUiObjToLayer", MARKERS)
         self.mk = {n: imp("UiHudLibTruckdmgmarker", n, HUD_LIB) for n in ("truckDmgModulePart", "partImg", "tfCont")}
         self.part_tf = imp("UiHudLibTruckdmgmodulepartname", "tf", HUD_LIB)
@@ -666,10 +670,22 @@ def patch_wheel_repair_part(w, fp):
     fp.insert(at, compile_block(body), redirect=False)
 
 
-def wheel_marker_release(w, fi):
-    m, c = w.c.m, w.c
-    mc = lambda: Call(GCall(c.g["GetCurrentGameSession"]), w.markers_ctrl)
-    return [If(Ne(mc(), NULL), [Do(Call(mc(), w.release, Const(m.const_string(fi, WHEEL_MARKER_ID))))])]
+def wheel_marker_remove(w, fp, fi, mc):
+    """убрать маркер колеса совсем: RemoveObj уничтожает значок (одно снятие с учёта
+    оставило бы его висеть на экране)"""
+    m = w.c.m
+    md, obj = fp.new_local(), fp.new_local()
+    mid = Const(m.const_string(fi, WHEEL_MARKER_ID))
+    return [
+        SetLocal(md, DictGet(Field(mc, w.markers), mid, NULL)),
+        If(Ne(Local(md), NULL), [
+            SetLocal(obj, NULL),
+            If(Ne(Field(Local(md), w.marker_data), NULL), [
+                SetLocal(obj, Field(Field(Local(md), w.marker_data), w.marker_obj))]),
+            If(Ne(Local(obj), NULL), [Do(Call(mc, w.remove_obj, Local(obj)))],
+               [Do(Call(mc, w.release, Const(m.const_string(fi, WHEEL_MARKER_ID))))]),
+        ]),
+    ]
 
 
 def patch_wheel_nav_panel(w, fp):
@@ -683,8 +699,7 @@ def patch_wheel_nav_panel(w, fp):
     view_order = lambda: Field(Field(Call(THIS, c.f["GetView"]), w.view_last), w.order)
     body = [
         SetLocal(mc, Call(GCall(c.g["GetCurrentGameSession"]), w.markers_ctrl)),
-        If(Ne(Local(mc), NULL), [
-            Do(Call(Local(mc), w.release, k(WHEEL_MARKER_ID))),
+        If(Ne(Local(mc), NULL), wheel_marker_remove(w, fp, fi, Local(mc)) + [
             SetLocal(truck, Field(THIS, c.f["targetTruck"])),
             If(And(Ge(part, Int(WHEEL_TYPE_BASE)), c.single_player(), Ne(Local(truck), NULL)), [
                 SetLocal(wheel, Sub(part, Int(WHEEL_TYPE_BASE))),
@@ -719,8 +734,12 @@ def patch_wheel_nav_panel(w, fp):
 
 def patch_wheel_hide(w, fp):
     """Hide: убрать маркер колеса"""
+    c = w.c
+    mc = fp.new_local()
+    body = [SetLocal(mc, Call(GCall(c.g["GetCurrentGameSession"]), w.markers_ctrl)),
+            If(Ne(Local(mc), NULL), wheel_marker_remove(w, fp, c.fi, Local(mc)))]
     at = 1 if fp.locals.has_reserve else 0
-    fp.insert(at, compile_block(wheel_marker_release(w, w.c.fi)), redirect=False)
+    fp.insert(at, compile_block(body), redirect=False)
 
 
 def apply_repair(ed, enabled):
@@ -897,6 +916,7 @@ class WheelView:
             "x", "y", "width", "height", "scaleX", "scaleY", "rotation", "visible", "LocalToOtherCoords")}
         self.vec_x, self.vec_y = imp("Vector2d", "x", VEC2), imp("Vector2d", "y", VEC2)
         self.items = imp("UiCoreList", "items", GFX_LIST)
+        self.row_header = imp("UiPopupLibPopuprepairlir", "headerTf", POPUP_LIB)
         self.item_data = imp("UiListItem", "data", GFX_LIST)
         self.add_callback = imp("Future", "AddCallback", FUTURE)
         self.g_loc = ensure_global(v, ed[SESSION], "GetLocalizationString")
@@ -954,15 +974,14 @@ def wheel_view_update_data(vc, wv, fp, fi, at, row, setdata):
     old = lambda: Field(THIS, vc.last)
     arrow = fp.new_local()
     fnref = v.const_method_ref(fi)
-    sw = lambda: Field(rv(), wv.switcher)
     make_arrows = []
-    for fld, btn, direction in ((wv.prev, wv.prev_btn, -WHEEL_FLIP_MOUSE), (wv.next, wv.next_btn, WHEEL_FLIP_MOUSE)):
+    # стрелка в библиотеке смотрит влево: правую отражаем по горизонтали
+    for fld, sx, direction in ((wv.prev, ARROW_SCALE, -WHEEL_FLIP_MOUSE), (wv.next, -ARROW_SCALE, WHEEL_FLIP_MOUSE)):
         make_arrows += [
             SetLocal(arrow, New(v.const_type(fi, wv.arrow_t))),
             Do(Call(Local(arrow), wv.set_parent, rv())),
-            SetField(Local(arrow), wv.ui["scaleX"], Field(Field(sw(), btn), wv.ui["scaleX"])),
-            SetField(Local(arrow), wv.ui["scaleY"], Field(Field(sw(), btn), wv.ui["scaleY"])),
-            SetField(Local(arrow), wv.ui["rotation"], Field(Field(sw(), btn), wv.ui["rotation"])),
+            SetField(Local(arrow), wv.ui["scaleX"], Const(v.const_float(fi, sx))),
+            SetField(Local(arrow), wv.ui["scaleY"], Const(v.const_float(fi, ARROW_SCALE))),
             SetField(Local(arrow), wv.ui["visible"], Bool(False)),
             Subscribe(Local(arrow), v.const_int(fi, wv.on_click),
                       Delegate(THIS, vc.switch_target, 1, v.const_type(fi, wv.cb_void_t), fnref, Int(direction))),
@@ -1005,13 +1024,13 @@ def wheel_view_hint(vc, wv, fp, fi):
     v = vc.v
     lst = lambda: Field(THIS, vc.list)
     rv = lambda: Field(THIS, vc.repair_view)
-    d, row_item, i, n, it, pos2, rx, ry = (fp.new_local() for _ in range(8))
-    show, a = fp.new_local(), fp.new_local()
+    d, row_item, i, n, it, pos2, ry = (fp.new_local() for _ in range(7))
+    show, a, hdr, ppos, npos = (fp.new_local() for _ in range(5))
+    sw = lambda: Field(rv(), wv.switcher)
     pre, widx, _ = wheel_row_lookup(wv, fp, Call(lst(), wv.get_data), Local(d))
     wdata = fp.new_local()
     U = wv.ui
     half = Const(v.const_float(fi, 0.5))
-    gap = Const(v.const_float(fi, ARROW_GAP))
     fx = lambda o, f: Field(o, U[f])
     body = [
         SetLocal(d, Field(THIS, vc.last)),
@@ -1029,19 +1048,24 @@ def wheel_view_hint(vc, wv, fp, fi):
                 ]),
             ]),
             If(Ne(Local(row_item), NULL), [
-                SetLocal(pos2, Call(Local(row_item), U["LocalToOtherCoords"], rv(), GCall(wv.g_vec_zero))),
-                If(Ne(Local(pos2), NULL), [
+                # по вертикали - по центру текста строки; по горизонтали - в тех же
+                # колонках, что стрелки переключателя цели (внутри окна, по бокам строк)
+                SetLocal(hdr, Field(Local(row_item), wv.row_header)),
+                SetLocal(pos2, NULL),
+                If(Ne(Local(hdr), NULL), [
+                    SetLocal(pos2, Call(Local(hdr), U["LocalToOtherCoords"], rv(), GCall(wv.g_vec_zero)))]),
+                SetLocal(ppos, Call(Field(sw(), wv.prev_btn), U["LocalToOtherCoords"], rv(), GCall(wv.g_vec_zero))),
+                SetLocal(npos, Call(Field(sw(), wv.next_btn), U["LocalToOtherCoords"], rv(), GCall(wv.g_vec_zero))),
+                If(And(Ne(Local(pos2), NULL), Ne(Local(ppos), NULL), Ne(Local(npos), NULL)), [
                     SetLocal(show, Bool(True)),
-                    SetLocal(rx, Field(Local(pos2), wv.vec_x)),
-                    SetLocal(ry, FAdd(Field(Local(pos2), wv.vec_y), FMul(fx(Local(row_item), "height"), half))),
-                    # стрелки по бокам строки (точка привязки стрелки считается в её центре)
+                    SetLocal(ry, FAdd(Field(Local(pos2), wv.vec_y), FMul(fx(Local(hdr), "height"), half))),
+                    # точка привязки стрелки - сверху: центрируем по высоте самой стрелки
                     SetLocal(a, Field(Local(d), wv.prev)),
-                    SetField(Local(a), U["x"], FSub(FSub(Local(rx), gap), FMul(fx(Local(a), "width"), half))),
-                    SetField(Local(a), U["y"], Local(ry)),
+                    SetField(Local(a), U["x"], Field(Local(ppos), wv.vec_x)),
+                    SetField(Local(a), U["y"], FSub(Local(ry), FMul(fx(Local(a), "height"), half))),
                     SetLocal(a, Field(Local(d), wv.next)),
-                    SetField(Local(a), U["x"], FAdd(FAdd(FAdd(Local(rx), fx(Local(row_item), "width")), gap),
-                                                    FMul(fx(Local(a), "width"), half))),
-                    SetField(Local(a), U["y"], Local(ry)),
+                    SetField(Local(a), U["x"], Field(Local(npos), wv.vec_x)),
+                    SetField(Local(a), U["y"], FSub(Local(ry), FMul(fx(Local(a), "height"), half))),
                 ]),
             ]),
             SetField(Field(Local(d), wv.prev), U["visible"], Local(show)),

@@ -781,6 +781,15 @@ class ArrGet(Expr):
         return self.idx.emit() + self.arr.emit() + [Ins(0x3F)]
 
 
+class DictGet(Expr):
+    """dict[key], а если ключа нет - default (как TryGet в коде игры)"""
+    def __init__(self, d, key, default):
+        self.d, self.key, self.default = d, key, default
+
+    def emit(self):
+        return self.default.emit() + self.key.emit() + self.d.emit() + [Ins(0x47)]
+
+
 class Count(Expr):
     def __init__(self, arr):
         self.arr = arr
