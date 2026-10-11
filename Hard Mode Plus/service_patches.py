@@ -1,5 +1,5 @@
 """
-Патчи сервиса (ремонт и груз) для SnowRunner, поверх библиотеки sslpatch.
+Патчи сервиса (ремонт, груз) и фар для SnowRunner, поверх библиотеки sslpatch.
 
   repair_from_nearby - окно ремонта берёт запчасти не только из аддонов и прицепа
       текущей машины, но и из любых машин/прицепов рядом (в т.ч. отцепленных
@@ -26,6 +26,10 @@
       слот груза, у брёвен вместо числа слотов - свой множитель для коротких,
       средних (и сожжённых) и длинных. Множитель цены погрузки NG+ по-прежнему
       применяется.
+  headlights_follow_player - фары привязаны к игроку: при пересадке в другой
+      грузовик его фары включаются или выключаются так, как они были у игрока
+      в прошлом грузовике. Покинутый грузовик с включёнными фарами гасит их сам
+      через заданное число секунд (как двигатель, который глохнет не сразу).
 
 В сетевой игре (кооператив) патчи окна ремонта ничего не меняют.
 
@@ -69,10 +73,13 @@ DAMAGE_HANDLER = "game.truck_damage_handler"
 TEXT_COLORS = "ui.ui_system.ui_text_colors"
 COLOR = "math.color"
 CARGO_LOADING = "ui.components.popups.cargo.popup_cargo_loading_ui_controller"
+TRUCK_INPUT = "game.truck_manager.truck_input_controller"
 
 WHEEL_KEY = "repair_single_wheel"
 LOADING_KEY = "cargo_loading_price"
-KEYS = ("repair_from_nearby", "repair_parts_transfer", "winch_unpack_cargo", WHEEL_KEY, LOADING_KEY)
+LIGHTS_KEY = "headlights_follow_player"
+KEYS = ("repair_from_nearby", "repair_parts_transfer", "winch_unpack_cargo", WHEEL_KEY, LOADING_KEY,
+        LIGHTS_KEY)
 
 # строка-метка в изменённых модулях: по ней видно, что initial.pak уже пропатчен
 MARKER = "hard_mode_plus_service_patch"
@@ -114,10 +121,14 @@ LOGS_TYPES = {"CargoLogsShort": "short", "CargoLogsMedium": "medium",
               "CargoLogsMedium_Burnt": "medium", "CargoLogsLong": "long"}
 LOADING_VALUE = (LOADING_DEFAULT, {k: v * 100 for k, v in LOGS_DEFAULT.items()})
 
-# модули, которые читаются (изменяются REPAIR, REPAIR_VIEW, HUD, DAMAGE и CARGO_LOADING)
+# фары: через сколько секунд покинутый грузовик гасит фары (значение настройки по умолчанию)
+LIGHTS_DEFAULT = 60
+LIGHTS_MAX = 3600
+
+# модули, которые читаются (изменяются REPAIR, REPAIR_VIEW, HUD, DAMAGE, CARGO_LOADING и TRUCK_INPUT)
 ALL_MODULES = {REPAIR, REPAIR_VIEW, HUD, TRUCK, ADDON, SESSION, TRUCKS_MANAGER, DAMAGE, HUD_LIB, GFX,
                GFX_LIST, LIST_ADAPTER, INPUT_SCREEN, INPUT_EVENT, MARKERS, TRANSFORM, VEC3, VEC2, FUTURE, NET_HEALTH,
-               DAMAGE_HUD, POPUP_LIB, DAMAGE_HANDLER, TEXT_COLORS, COLOR, CARGO_LOADING}
+               DAMAGE_HUD, POPUP_LIB, DAMAGE_HANDLER, TEXT_COLORS, COLOR, CARGO_LOADING, TRUCK_INPUT}
 
 
 class Sym:
@@ -1478,6 +1489,83 @@ def apply_cargo_loading(ed, value):
     m.set_func_code(fi, fp.build())
 
 # ---------------------------------------------------------------------------
+# фары
+
+
+def apply_lights(ed, delay):
+    """Фары привязаны к игроку (TruckInputController.currHeadLightsOn - фары у игрока).
+    delay - через сколько секунд покинутый грузовик с включёнными фарами гасит их."""
+    m = ed[TRUCK_INPUT]
+    C = "TruckInputController"
+    cur = member_slot(m, C, "currTruck")
+    lights = member_slot(m, C, "currHeadLightsOn")
+    sched = member_slot(m, C, "scheduler")
+    session = member_slot(m, C, "gameSession")
+    set_lights = member_slot(m, C, "SetLights")
+    lights_off = member_slot(m, C, "UpdateTruckStickersMaterial")
+    enable = ext_slot(m, "EnableHeadLight", "Truck")
+    get_input = ext_slot(m, "GetTruckInput", "Truck")
+    is_on = ext_slot(m, "isHeadLight", "TruckInput")
+    get_tm = ext_slot(m, "GetTrucksManager", "GameSession")
+    sched_delay = ext_slot(m, "Delay", "AsyncScheduler")
+    all_trucks = ensure_member(m, "TrucksManager", "GetAllTrucks", ed[TRUCKS_MANAGER])
+    void_t = m.find_type("__class__void_")
+    if void_t is None:
+        raise PatchError("тип __class__void_ не найден в %s" % m.name)
+
+    def set_if_alive(fp, truck, on):
+        """truck.EnableHeadLight(on), если машина ещё есть в списке машин игры
+        (удалённую машину не трогаем)"""
+        tm, arr, i, n, t = (fp.new_local() for _ in range(5))
+        return [
+            SetLocal(tm, Cond(Ne(Field(THIS, session), NULL), Call(Field(THIS, session), get_tm), NULL)),
+            If(Ne(Local(tm), NULL), [
+                SetLocal(arr, Call(Local(tm), all_trucks)),
+                ForEach(Local(arr), i, n, t, [
+                    If(Eq(Local(t), truck), [Do(Call(truck, enable, Bool(on))), Break()]),
+                ]),
+            ]),
+        ]
+
+    # UpdateTruckStickersMaterial(truck) игра вызывает только из SetActiveTruck для новой
+    # текущей машины. Вызов для другой машины (из отложенной задачи) гасит её фары.
+    fi = m.func_index("UpdateTruckStickersMaterial", C)
+    fp = FunctionPatch(m.func_code(fi))
+    truck = Local(1)
+    fp.insert(0, compile_block([If(And(Ne(truck, NULL), Ne(truck, Field(THIS, cur))),
+                                   set_if_alive(fp, truck, False) + [ReturnVoid(2)])]))
+    m.set_func_code(fi, fp.build())
+
+    # SetActiveTruck(truck): фары игрока переносятся на новую машину
+    fi = m.func_index("SetActiveTruck", C)
+    fp = FunctionPatch(m.func_code(fi))
+    old, on = fp.new_local(), fp.new_local()
+    fp.insert(0, compile_block([SetLocal(old, Field(THIS, cur)), SetLocal(on, Field(THIS, lights))]))
+    # currHeadLightsOn = currTruck != null ? currTruck.GetTruckInput().isHeadLight : false;
+    # без машины (выход в гараж, смена карты) фары игрока не сбрасываются
+    at = find_one(fp.code, "07:0 0a:%d 03:0 30:8 16:* 01:1 07:0 0a:%d 04:0 0d:%d 0a:%d 1a:* 05:0 07:0 3c:%d 02:0"
+                  % (cur, cur, get_input, is_on, lights), "lights/active-truck")
+    fp.replace(at + 12, at + 13, Field(THIS, lights).emit())
+    if delay > 0:
+        # покинутая машина: фары снова включить (игра гасит их при пересадке) и
+        # погасить через delay секунд
+        fnref = m.const_method_ref(fi)
+        leave = set_if_alive(fp, Local(old), True) + [
+            Do(Call(Field(THIS, sched), sched_delay, Int(delay * 1000),
+                    Delegate(THIS, lights_off, 1, m.const_type(fi, void_t), fnref, Local(old))))]
+    else:
+        leave = [Do(Call(THIS, lights_off, Local(old)))]
+    truck = Local(1)
+    fp.insert(at + 16, compile_block([If(Ne(truck, NULL), [
+        # из другой машины - фары как у игрока; первая машина (загрузка карты) - включить,
+        # если фары у игрока были включены, иначе оставить как есть
+        If(And(Or(Ne(Local(old), NULL), Local(on)), Ne(Local(on), Field(THIS, lights))), [
+            Do(Call(THIS, set_lights, Local(on)))]),
+        If(And(Local(on), Ne(Local(old), NULL), Ne(Local(old), truck)), leave),
+    ])]))
+    m.set_func_code(fi, fp.build())
+
+# ---------------------------------------------------------------------------
 
 
 def apply(ed, enabled):
@@ -1500,16 +1588,20 @@ def apply(ed, enabled):
     if LOADING_KEY in enabled:
         apply_cargo_loading(ed, enabled[LOADING_KEY])
         changed.add(CARGO_LOADING)
+    if LIGHTS_KEY in enabled:
+        apply_lights(ed, enabled[LIGHTS_KEY])
+        changed.add(TRUCK_INPUT)
     for n in changed:
         ed[n].string(MARKER)
     return changed
 
 
 def is_patched(ed):
-    return any(MARKER in ed[n].strings for n in (REPAIR, REPAIR_VIEW, HUD, DAMAGE, CARGO_LOADING) if n in ed)
+    return any(MARKER in ed[n].strings for n in (REPAIR, REPAIR_VIEW, HUD, DAMAGE, CARGO_LOADING, TRUCK_INPUT)
+               if n in ed)
 
 
 def check(ed):
     """проверка, что все места правок находятся (на копиях модулей)"""
     apply({k: ModEditor(v.blob(), v.name) for k, v in ed.items()},
-          {k: LOADING_VALUE if k == LOADING_KEY else True for k in KEYS})
+          {k: {LOADING_KEY: LOADING_VALUE, LIGHTS_KEY: LIGHTS_DEFAULT}.get(k, True) for k in KEYS})
