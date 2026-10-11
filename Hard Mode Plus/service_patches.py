@@ -92,10 +92,10 @@ SAME_AXLE = 0.3             # колёса ближе 0.3 м по длине м�
 ARROW_SCALE = 60.0          # стрелки колёс меньше стрелок переключателя цели (масштаб в
                             # процентах, как scaleX в игре: 100 - обычный размер)
 # стрелки колёс сдвинуты от колонок стрелок «Цели» внутрь, к краям строки, на эту долю
-# расстояния между стрелками «Цели»; по высоте - центр стрелки на центре текста строки
-# плюс доля высоты стрелки (подобрано по скриншоту окна)
+# расстояния между стрелками «Цели»; по высоте - от центра текста строки на эту долю
+# высоты стрелки (её height больше видимого рисунка; оба числа подобраны по скриншотам)
 ARROW_INSET = 0.0625
-ARROW_DROP = 0.1
+ARROW_SHIFT_Y = -0.227
 # новые поля данных окна (PopupRepairUiViewData2)
 F_ORDER, F_PREV, F_NEXT = "hmpWheelOrder", "hmpPrevArrow", "hmpNextArrow"
 
@@ -581,11 +581,14 @@ class WheelCtx:
         self.view_colors = imp("PopupRepairUiViewNew", "colors", REPAIR_VIEW)
         self.by_status = imp("UiTextColors", "GetColorByStatusMinMax", TEXT_COLORS)
         self.red = imp("UiTextColors", "redColor", TEXT_COLORS)
-        self.white = imp("UiTextColors", "whiteColor", TEXT_COLORS)
+        self.yellow = imp("UiTextColors", "yellowColor", TEXT_COLORS)
         self.color_eq = imp("Color", "IsEqual", COLOR)
-        # умножение цвета (как подкрашивает значки игра): белый рисунок колеса
-        # окрашивается, тёмный кружок под ним остаётся как есть
-        self.ct_setup = imp("UiColorTransform", "SetupMultiplyer", GFX)
+        # жёлтое колесо: рисунок умножается на цвет, прозрачность не меняется
+        # (SetupMultiplyer игры ещё и делает значок непрозрачным - кружок чернеет)
+        self.ct_mult = imp("UiColorTransform", "multiplier", GFX)
+        self.ct_shift = imp("UiColorTransform", "shift", GFX)
+        self.rgba = {n: imp("Color", n, COLOR) for n in ("a", "r", "g", "b")}
+        self.color_t = m.class_type("Color")
         self.color_tf = imp("UiDisplayObjectBase", "colorTransform", GFX)
         self.is_html = imp("UiLabel", "isHtml", GFX)
         self.g_html = ensure_global(m, ed[REPAIR_VIEW], "HtmlColorText")
@@ -728,7 +731,7 @@ def patch_wheel_nav_panel(w, fp):
     T, D = w.t, w.dmg
     part = Local(1)
     mc, truck, wheel, wd, pw, d, mk, img, num, last = (fp.new_local() for _ in range(10))
-    hp, col, colors, ct, dh, offs, get_pos = (fp.new_local() for _ in range(7))
+    hp, col, colors, ct, cm, cs, dh, offs, get_pos = (fp.new_local() for _ in range(9))
     S = lambda v: Cast(v, m.const_type(fi, w.string_t))
     F = lambda v: Cast(v, m.const_type(fi, w.float_t))
     k = lambda s_: Const(m.const_string(fi, s_))
@@ -758,8 +761,8 @@ def patch_wheel_nav_panel(w, fp):
                     SetField(Field(Field(Local(mk), w.mk["truckDmgModulePart"]), w.part_tf), w.label_text,
                              Concat(Concat(GCall(w.g_loc, k(WHEEL_LABEL)), k(" ")), S(Local(num)))),
                     # цвет - как у строки колеса в окне: белый, жёлтый (<= 75%), красный (<= 25%).
-                    # У значка маркера только два кадра (normal и красный damaged), поэтому
-                    # damaged - только у красного, а жёлтый виден по цифре и значку колеса
+                    # Красное колесо - кадр damaged маркера, как в оверлее урона (рисунок колеса
+                    # игра красит сама); жёлтое - рисунок колеса умножается на жёлтый
                     SetLocal(colors, Field(view(), w.view_colors)),
                     SetLocal(col, NULL),
                     If(Ne(Local(colors), NULL), [
@@ -770,9 +773,15 @@ def patch_wheel_nav_panel(w, fp):
                         SetField(value_tf(), w.label_text,
                                  Concat(Concat(GCall(w.g_html, S(Local(hp)), Local(col)), k("/")),
                                         S(Field(Local(d), D["damageCapacity"])))),
-                        If(Not(Call(Local(col), w.color_eq, Field(Local(colors), w.white))), [
+                        If(Call(Local(col), w.color_eq, Field(Local(colors), w.yellow)), [
                             SetLocal(ct, New(m.const_type(fi, w.ct_t))),
-                            Do(Call(Local(ct), w.ct_setup, Local(col))),
+                            SetLocal(cm, New(m.const_type(fi, w.color_t))),
+                            SetField(Local(cm), w.rgba["a"], Const(m.const_float(fi, 255.0))),
+                        ] + [SetField(Local(cm), w.rgba[ch], Field(Local(col), w.rgba[ch])) for ch in "rgb"] + [
+                            SetLocal(cs, New(m.const_type(fi, w.color_t))),
+                        ] + [SetField(Local(cs), w.rgba[ch], Const(m.const_float(fi, 0.0))) for ch in "argb"] + [
+                            SetField(Local(ct), w.ct_mult, Local(cm)),
+                            SetField(Local(ct), w.ct_shift, Local(cs)),
                             SetField(Local(img), w.color_tf, Local(ct)),
                         ]),
                     ], [
@@ -1143,7 +1152,7 @@ def wheel_view_hint(vc, wv, fp, fi):
     U = wv.ui
     half = Const(v.const_float(fi, 0.5))
     inset = Const(v.const_float(fi, ARROW_INSET))
-    drop = Const(v.const_float(fi, ARROW_DROP))
+    drop = Const(v.const_float(fi, ARROW_SHIFT_Y))
     fx = lambda o, f: Field(o, U[f])
     body = [
         SetLocal(d, Field(THIS, vc.last)),
@@ -1173,7 +1182,6 @@ def wheel_view_hint(vc, wv, fp, fi):
                     SetLocal(show, Bool(True)),
                     SetLocal(ry, FAdd(Field(Local(pos2), wv.vec_y), FMul(fx(Local(hdr), "height"), half))),
                     SetLocal(dx, FMul(FSub(Field(Local(npos), wv.vec_x), Field(Local(ppos), wv.vec_x)), inset)),
-                    # точка привязки стрелки - в её центре
                     SetLocal(a, Field(Local(d), wv.prev)),
                     SetField(Local(a), U["x"], FAdd(Field(Local(ppos), wv.vec_x), Local(dx))),
                     SetField(Local(a), U["y"], FAdd(Local(ry), FMul(fx(Local(a), "height"), drop))),
