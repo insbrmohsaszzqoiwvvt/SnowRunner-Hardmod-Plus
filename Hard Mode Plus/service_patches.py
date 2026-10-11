@@ -17,8 +17,10 @@
   repair_single_wheel - у строки «Колёса» окна ремонта появляются стрелки (мышь и
       стрелки клавиатуры): «Колёса» (как в игре) -> «Колесо 1» -> «Колесо 2» ...
       (слева направо, спереди назад). У отдельного колеса показан его урон,
-      выбранное колесо отмечено на машине маркером, как в оверлее урона,
-      «Ремонт» меняет это колесо на запасное (одно колесо из источника).
+      выбранное колесо отмечено на машине маркером, как в оверлее урона (маркер
+      едет вместе с машиной, цвет - как у строки в окне), «Ремонт» меняет это
+      колесо на запасное (одно колесо из источника). Первая цифра «Колёса»
+      окрашена по худшему колесу.
 
 В сетевой игре (кооператив) патчи окна ремонта ничего не меняют.
 
@@ -33,7 +35,8 @@ from sslpatch import (PatchError, ModEditor, Local, THIS, Int, Bool, NULL, Const
                       SetLocal, SetField, Do, ArrAdd, ArrSet, If, While, Break, Continue, Block, ForEach,
                       Goto, Return, ReturnVoid, FunctionPatch, Ins, Jmp, Label, newlabel, find_one,
                       find_all, ensure_member, ensure_global, member_slot, compile_block, import_type,
-                      Cast, FAdd, FSub, FMul, FGt, FGe, Concat, Delegate, Subscribe, Unsubscribe, DictGet)
+                      Cast, FAdd, FSub, FMul, FLt, FGt, FGe, Concat, Delegate, Subscribe, Unsubscribe, DictGet,
+                      DictSet)
 
 REPAIR = "ui.components.popups.repair.popup_repair_ui_controller_new"
 REPAIR_VIEW = "ui.components.popups.repair.popup_repair_ui_view_new"
@@ -57,6 +60,9 @@ FUTURE = "ssl.lib.future"
 NET_HEALTH = "network.net_health_controller"
 DAMAGE_HUD = "ui.hud.hud_viewes.hud_truck_state_indication_ui_view"
 POPUP_LIB = "ui.autogen_libs.ui_popup_lib"
+DAMAGE_HANDLER = "game.truck_damage_handler"
+TEXT_COLORS = "ui.ui_system.ui_text_colors"
+COLOR = "math.color"
 
 WHEEL_KEY = "repair_single_wheel"
 KEYS = ("repair_from_nearby", "repair_parts_transfer", "winch_unpack_cargo", WHEEL_KEY)
@@ -83,14 +89,15 @@ WHEEL_FLIP_MOUSE = 1000     # SwitchTarget(±1000) вида - стрелка м�
 WHEEL_FLIP_KEY = 2000       # SwitchTarget(±2000) - стрелка клавиатуры (только на строке колёс)
 WHEEL_MARKER_ID = "hmp_wheel_marker"
 SAME_AXLE = 0.3             # колёса ближе 0.3 м по длине машины - на одной оси
-ARROW_SCALE = 0.6           # стрелки колёс меньше стрелок переключателя цели
+ARROW_SCALE = 60.0          # стрелки колёс меньше стрелок переключателя цели (масштаб в
+                            # процентах, как scaleX в игре: 100 - обычный размер)
 # новые поля данных окна (PopupRepairUiViewData2)
 F_ORDER, F_PREV, F_NEXT = "hmpWheelOrder", "hmpPrevArrow", "hmpNextArrow"
 
 # модули, которые читаются (изменяются REPAIR, REPAIR_VIEW, HUD и DAMAGE)
 ALL_MODULES = {REPAIR, REPAIR_VIEW, HUD, TRUCK, ADDON, SESSION, TRUCKS_MANAGER, DAMAGE, HUD_LIB, GFX,
                GFX_LIST, LIST_ADAPTER, INPUT_SCREEN, INPUT_EVENT, MARKERS, TRANSFORM, VEC3, VEC2, FUTURE, NET_HEALTH,
-               DAMAGE_HUD, POPUP_LIB}
+               DAMAGE_HUD, POPUP_LIB, DAMAGE_HANDLER, TEXT_COLORS, COLOR}
 
 
 class Sym:
@@ -535,7 +542,8 @@ class WheelCtx:
         m = c.m
         self.c = c
         imp = lambda cls, n, mod, dc=None: ensure_member(m, cls, n, ed[mod], dc)
-        self.t = {n: imp("Truck", n, TRUCK) for n in ("wheelDamages", "GetPosWheels", "GetChassisWorldTransformValue")}
+        self.t = {n: imp("Truck", n, TRUCK) for n in ("wheelDamages", "GetPosWheels", "GetChassisWorldTransformValue",
+                                                      "GetTransformValue", "truckDamageHandler")}
         self.dmg = {n: imp("DamageData", n, ADDON) for n in ("damage", "damageCapacity")}
         self.point = imp("Transform3d", "TransformPoint", TRANSFORM)
         self.vx, self.vz = imp("Vector3d", "x", VEC3), imp("Vector3d", "z", VEC3)
@@ -556,6 +564,25 @@ class WheelCtx:
         self.set_parent = imp("UiDisplayObjectBase", "SetParent", GFX)
         self.goto_stop = imp("UiMovieClip", "GotoAndStop", GFX)
         self.view_last = imp("PopupRepairUiViewNew", "lastData", REPAIR_VIEW)
+        # маркер следует за машиной так же, как всплывающие цифры урона: смещение от
+        # машины лежит в TruckDamageHandler.markersOffsets, позицию каждый кадр даёт его
+        # GetMarkerPos (делегат getPos маркера)
+        self.dh_offsets = imp("TruckDamageHandler", "markersOffsets", DAMAGE_HANDLER)
+        self.dh_get_pos = imp("TruckDamageHandler", "GetMarkerPos", DAMAGE_HANDLER)
+        mk_mod = ed[MARKERS]
+        cb = mk_mod.find_type("CbReturnVector3d")
+        self.get_pos_t = None if cb is None else import_type(m, mk_mod, cb)
+        # цвет - как у строк окна ремонта (UiTextColors: белый / жёлтый / красный)
+        self.view_colors = imp("PopupRepairUiViewNew", "colors", REPAIR_VIEW)
+        self.by_status = imp("UiTextColors", "GetColorByStatusMinMax", TEXT_COLORS)
+        self.red = imp("UiTextColors", "redColor", TEXT_COLORS)
+        self.white = imp("UiTextColors", "whiteColor", TEXT_COLORS)
+        self.color_eq = imp("Color", "IsEqual", COLOR)
+        self.ct_setup = imp("UiColorTransform", "SetupColorTransform", GFX)
+        self.color_tf = imp("UiDisplayObjectBase", "colorTransform", GFX)
+        self.is_html = imp("UiLabel", "isHtml", GFX)
+        self.g_html = ensure_global(m, ed[REPAIR_VIEW], "HtmlColorText")
+        self.ct_t = m.class_type("UiColorTransform")
         self.order = imp("PopupRepairUiViewData2", F_ORDER, REPAIR_VIEW)
         self.arr_index_of = 14                                  # array.IndexOf (встроенный класс)
         self.arr_contains = 15                                  # array.Contains
@@ -565,9 +592,9 @@ class WheelCtx:
         self.int_array_t = import_type(m, net, net.member_type(net.class_index("DamageParams"), "wheelDamageValue"))
         self.marker_t = m.class_type("UiHudLibTruckdmgmarker")
         self.wheel_img_t = m.class_type("UiHudLibImgwheels")
-        self.string_t = m.find_type("string")
-        if self.string_t is None:
-            raise PatchError("тип string не найден в %s" % m.name)
+        self.string_t, self.float_t = m.find_type("string"), m.find_type("float")
+        if None in (self.string_t, self.float_t, self.get_pos_t):
+            raise PatchError("типы string/float/CbReturnVector3d не найдены в %s" % m.name)
 
     def wheel_ok(self, src, truck, w):
         """есть чем заменить колесо w машины truck и оно повреждено"""
@@ -694,9 +721,14 @@ def patch_wheel_nav_panel(w, fp):
     T, D = w.t, w.dmg
     part = Local(1)
     mc, truck, wheel, wd, pw, d, mk, img, num, last = (fp.new_local() for _ in range(10))
+    hp, col, colors, ct, dh, offs, get_pos = (fp.new_local() for _ in range(7))
     S = lambda v: Cast(v, m.const_type(fi, w.string_t))
+    F = lambda v: Cast(v, m.const_type(fi, w.float_t))
     k = lambda s_: Const(m.const_string(fi, s_))
-    view_order = lambda: Field(Field(Call(THIS, c.f["GetView"]), w.view_last), w.order)
+    view = lambda: Call(THIS, c.f["GetView"])
+    view_order = lambda: Field(Field(view(), w.view_last), w.order)
+    value_tf = lambda: Field(Field(Field(Local(mk), w.mk["tfCont"]), w.dmg_value), w.value_tf)
+    marker_id = k(WHEEL_MARKER_ID)
     body = [
         SetLocal(mc, Call(GCall(c.g["GetCurrentGameSession"]), w.markers_ctrl)),
         If(Ne(Local(mc), NULL), wheel_marker_remove(w, fp, fi, Local(mc)) + [
@@ -707,9 +739,10 @@ def patch_wheel_nav_panel(w, fp):
                 SetLocal(pw, Call(Local(truck), T["GetPosWheels"])),
                 If(And(Ne(Local(pw), NULL), Lt(Local(wheel), Count(Local(wd))), Lt(Local(wheel), Count(Local(pw)))), [
                     SetLocal(d, ArrGet(Local(wd), Local(wheel))),
+                    SetLocal(hp, Sub(Field(Local(d), D["damageCapacity"]), Field(Local(d), D["damage"]))),
                     # номер колеса в списке (как в строке окна)
                     SetLocal(num, Add(Local(wheel), Int(1))),
-                    SetLocal(last, Field(Call(THIS, c.f["GetView"]), w.view_last)),
+                    SetLocal(last, Field(view(), w.view_last)),
                     If(And(Ne(Local(last), NULL), Ne(Field(Local(last), w.order), NULL)), [
                         SetLocal(num, Add(Call(view_order(), w.arr_index_of, Local(wheel)), Int(1)))]),
                     SetLocal(mk, New(m.const_type(fi, w.marker_t))),
@@ -717,13 +750,47 @@ def patch_wheel_nav_panel(w, fp):
                     Do(Call(Local(img), w.set_parent, Field(Local(mk), w.mk["partImg"]))),
                     SetField(Field(Field(Local(mk), w.mk["truckDmgModulePart"]), w.part_tf), w.label_text,
                              Concat(Concat(GCall(w.g_loc, k(WHEEL_LABEL)), k(" ")), S(Local(num)))),
-                    SetField(Field(Field(Field(Local(mk), w.mk["tfCont"]), w.dmg_value), w.value_tf), w.label_text,
-                             Concat(Concat(S(Sub(Field(Local(d), D["damageCapacity"]), Field(Local(d), D["damage"]))),
-                                           k("/")), S(Field(Local(d), D["damageCapacity"])))),
+                    # цвет - как у строки колеса в окне: белый, жёлтый (<= 75%), красный (<= 25%).
+                    # У значка маркера только два кадра (normal и красный damaged), поэтому
+                    # damaged - только у красного, а жёлтый виден по цифре и значку колеса
+                    SetLocal(colors, Field(view(), w.view_colors)),
+                    SetLocal(col, NULL),
+                    If(Ne(Local(colors), NULL), [
+                        SetLocal(col, Call(Local(colors), w.by_status, F(Local(hp)),
+                                           F(Field(Local(d), D["damageCapacity"]))))]),
+                    If(Ne(Local(col), NULL), [
+                        SetField(value_tf(), w.is_html, Bool(True)),
+                        SetField(value_tf(), w.label_text,
+                                 Concat(Concat(GCall(w.g_html, S(Local(hp)), Local(col)), k("/")),
+                                        S(Field(Local(d), D["damageCapacity"])))),
+                        If(Not(Call(Local(col), w.color_eq, Field(Local(colors), w.white))), [
+                            SetLocal(ct, New(m.const_type(fi, w.ct_t))),
+                            Do(Call(Local(ct), w.ct_setup, Local(col))),
+                            SetField(Local(img), w.color_tf, Local(ct)),
+                        ]),
+                    ], [
+                        SetField(value_tf(), w.label_text,
+                                 Concat(Concat(S(Local(hp)), k("/")), S(Field(Local(d), D["damageCapacity"])))),
+                    ]),
                     Do(Call(Local(mk), w.goto_stop,
-                            Cond(Gt(Field(Local(d), D["damage"]), Int(0)), k("damaged"), k("normal")))),
-                    Do(Call(Local(mc), w.add_obj, Local(mk), ArrGet(Local(pw), Local(wheel)), k(WHEEL_MARKER_ID),
-                            Int(0), NULL, NULL, Bool(False))),
+                            Cond(And(Ne(Local(col), NULL), Call(Local(col), w.color_eq, Field(Local(colors), w.red))),
+                                 k("damaged"), k("normal")))),
+                    # привязка к машине: смещение колеса от машины -> markersOffsets,
+                    # позицию каждый кадр считает TruckDamageHandler.GetMarkerPos
+                    SetLocal(get_pos, NULL),
+                    SetLocal(dh, Field(Local(truck), T["truckDamageHandler"])),
+                    If(Ne(Local(dh), NULL), [
+                        SetLocal(offs, Field(Local(dh), w.dh_offsets)),
+                        If(Ne(Local(offs), NULL), [
+                            DictSet(Local(offs), marker_id,
+                                    Call(GCall(w.g_invert, Call(Local(truck), T["GetTransformValue"])), w.point,
+                                         ArrGet(Local(pw), Local(wheel)))),
+                            SetLocal(get_pos, Delegate(Local(dh), w.dh_get_pos, 1, m.const_type(fi, w.get_pos_t),
+                                                       m.const_method_ref(fi), marker_id)),
+                        ]),
+                    ]),
+                    Do(Call(Local(mc), w.add_obj, Local(mk), ArrGet(Local(pw), Local(wheel)), marker_id,
+                            Int(0), NULL, Local(get_pos), Bool(False))),
                 ]),
             ]),
         ]),
@@ -927,10 +994,18 @@ class WheelView:
         self.next_btn = ext_slot(v, "nextBtn", "UiPopupLibHudpopuprepairtargetswitcher")
         self.ui_sounds = ext_slot(v, "uiSounds")
         self.play_sound = ext_slot(v, "PlaySound", "UiSounds")
+        # цвет строки «Колёса» - по худшему колесу
+        self.health = member_slot(v, "PopupRepairUiViewTruckData", "health")
+        self.value_text = member_slot(v, "PopupRepairUiViewLirItemData", "valueText")
+        self.item_color = member_slot(v, "PopupRepairUiViewLirItemData", "color")
+        self.colors = member_slot(v, vc.V, "colors")
+        self.by_status = imp("UiTextColors", "GetColorByStatusMinMax", TEXT_COLORS)
+        self.g_html = ext_gid(v, "HtmlColorText")
+        self.float_t = v.find_type("float")
         self.cb_void_t = v.find_type("__class__void_")
         self.cb_variant_t = v.find_type("__class__void__variant")
         self.string_t = v.find_type("string")
-        if None in (self.cb_void_t, self.cb_variant_t, self.string_t):
+        if None in (self.cb_void_t, self.cb_variant_t, self.string_t, self.float_t):
             raise PatchError("не найдены типы делегатов в %s" % v.name)
         self.arr_index_of = 14
 
@@ -961,6 +1036,34 @@ def wheel_name(wv, fi, pos):
     k = lambda s_: Const(v.const_string(fi, s_))
     return Concat(Concat(GCall(wv.g_loc, k(WHEEL_LABEL)), k(" ")),
                   Cast(Add(pos, Int(1)), v.const_type(fi, wv.string_t)))
+
+
+def wheels_row_color(vc, wv, fp, fi, item, dd):
+    """строка «Колёса»: первая цифра и значок - цветом худшего колеса (белый / жёлтый /
+    красный, как у строк окна), а не по числу лопнувших колёс"""
+    v = vc.v
+    j, best, e, b, col = (fp.new_local() for _ in range(5))
+    H, M = wv.health, vc.max_health
+    F = lambda x: Cast(x, v.const_type(fi, wv.float_t))
+    S = lambda x: Cast(x, v.const_type(fi, wv.string_t))
+    fld = lambda x, f: F(Field(Local(x), f))
+    total = lambda: ArrGet(dd(), Int(1))
+    return [If(Gt(Count(dd()), Int(WHEEL_DD_BASE)), [
+        SetLocal(best, Int(WHEEL_DD_BASE)),
+        SetLocal(j, Int(WHEEL_DD_BASE + 1)),
+        While(Lt(Local(j), Count(dd())), [
+            SetLocal(e, ArrGet(dd(), Local(j))),
+            SetLocal(b, ArrGet(dd(), Local(best))),
+            # e.health / e.max < b.health / b.max (без деления)
+            If(FLt(FMul(fld(e, H), fld(b, M)), FMul(fld(b, H), fld(e, M))), [SetLocal(best, Local(j))]),
+        ], step=[SetLocal(j, Add(Local(j), Int(1)))]),
+        SetLocal(b, ArrGet(dd(), Local(best))),
+        SetLocal(col, Call(Field(THIS, wv.colors), wv.by_status, fld(b, H), fld(b, M))),
+        SetField(item, wv.value_text,
+                 Concat(Concat(GCall(wv.g_html, S(Field(total(), H)), Local(col)), Const(v.const_string(fi, "/"))),
+                        S(Field(total(), M)))),
+        SetField(item, wv.item_color, Local(col)),
+    ])]
 
 
 def wheel_view_update_data(vc, wv, fp, fi, at, row, setdata):
@@ -1005,7 +1108,8 @@ def wheel_view_update_data(vc, wv, fp, fi, at, row, setdata):
                                 Const(icon_k), dd())),
             SetField(Local(item), vc.item_type, Add(ArrGet(order(), Local(pos)), Int(WHEEL_TYPE_BASE))),
         ]),
-        If(Eq(Local(item), NULL), [SetLocal(item, Call(THIS, vc.create_row, Int(1), Const(label_k), Const(icon_k), dd()))]),
+        If(Eq(Local(item), NULL), [SetLocal(item, Call(THIS, vc.create_row, Int(1), Const(label_k), Const(icon_k), dd())),
+                                   ] + wheels_row_color(vc, wv, fp, fi, Local(item), dd)),
     ]
     fp.insert(row, compile_block(body))
     fp.replace(row, row + 9, [Ins(0x07, item)])
@@ -1156,6 +1260,14 @@ def apply_wheel_view(ed, vc, wv):
     fi = v.func_index("GetFullRepairCostStr", V)
     fp = FunctionPatch(v.func_code(fi))
     at = find_one(fp.code, "07:-3 41:0 3b:-4 02:0", "View/full-cost") + 4
+    fp.insert(at, compile_block([If(Gt(Local(-4), Int(WHEEL_DD_BASE)), [SetLocal(-4, Int(WHEEL_DD_BASE))])]))
+    v.set_func_code(fi, fp.build())
+
+    # UpdateFullRepairHint: подсказка «Все» тоже только по 5 узлам - строки отдельных
+    # колёс (частично побитых) не должны требовать очков ремонта колёс
+    fi = v.func_index("UpdateFullRepairHint", V)
+    fp = FunctionPatch(v.func_code(fi))
+    at = find_one(fp.code, "07:-3 41:0 3b:-4 02:0", "View/full-hint") + 4
     fp.insert(at, compile_block([If(Gt(Local(-4), Int(WHEEL_DD_BASE)), [SetLocal(-4, Int(WHEEL_DD_BASE))])]))
     v.set_func_code(fi, fp.build())
 

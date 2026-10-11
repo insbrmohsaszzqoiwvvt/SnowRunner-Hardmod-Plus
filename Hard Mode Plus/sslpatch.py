@@ -462,9 +462,11 @@ class ModEditor:
         # поле 4 - fixed32 (тип 5), как у констант игры
         return self.add_func_const(i, msg((1, 3), (4, ("raw", b"\x25" + struct.pack("<f", v)))))
 
-    def const_method_ref(self, i):
-        """ссылка «метод объекта» для создания делегата (14)"""
-        return self.add_func_const(i, msg((1, 6), (7, 0)))
+    def const_method_ref(self, i, nparams=1):
+        """ссылка «метод объекта» для создания делегата (14); в поле 7 - порядок
+        параметров метода, по 4 бита на параметр (как в коде игры: 0, 0x10, 0x210...)"""
+        order = sum(p << (4 * p) for p in range(nparams))
+        return self.add_func_const(i, msg((1, 6), (7, order)))
 
     def set_func_code(self, i, instrs):
         fl = self.func_fields(i)
@@ -992,6 +994,15 @@ class ArrSet(Stmt):
 
     def emit(self):
         return self.val.emit() + self.idx.emit() + self.arr.emit() + [Ins(0x40), Ins(0x02)]
+
+
+class DictSet(Stmt):
+    """dict[key] = val (запись с заменой, как в коде игры)"""
+    def __init__(self, d, key, val):
+        self.d, self.key, self.val = d, key, val
+
+    def emit(self):
+        return self.val.emit() + self.key.emit() + self.d.emit() + [Ins(0x45), Ins(0x02)]
 
 
 class If(Stmt):
