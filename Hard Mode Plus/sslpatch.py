@@ -202,6 +202,7 @@ class ModEditor:
         self.new_types = []
         self.dirty_ext = False
         self.func_updates = {}
+        self.class_updates = set()
 
     # строки
     def all_strings(self):
@@ -285,13 +286,55 @@ class ModEditor:
         out = []
         for mm in pb_get(pb_parse(self.classes_raw[ci]), 3):
             m = pb_parse(mm)
-            out.append((self.strings[pb_first(m, 1)], pb_first(m, 2), pb_first(m, 3), pb_first(m, 4)))
+            out.append((self.all_strings()[pb_first(m, 1)], pb_first(m, 2), pb_first(m, 3), pb_first(m, 4)))
         return out
 
     def local_class_type(self, name):
         """индекс типа (вид 1) класса этого модуля."""
         ci = self.class_index(name)
         return self.add_type(msg((1, 1), (2, ci)))
+
+    def member_type(self, ci, member):
+        """тип члена класса: поле (вид 4/5) - тип поля, метод - сигнатура, событие - тип делегата"""
+        for mm in pb_get(pb_parse(self.classes_raw[ci]), 3):
+            m = pb_parse(mm)
+            if self.all_strings()[pb_first(m, 1)] != member:
+                continue
+            k = pb_first(m, 3)
+            if k in (1, 2):
+                return self.func_sig(pb_first(m, 4))
+            if k == 4:
+                return pb_first(m, 4)
+            if k == 5:
+                return pb_first(pb_parse(pb_first(m, 8)), 1)
+            if k == 3:
+                return pb_first(pb_parse(pb_first(m, 6)), 1)
+            raise PatchError("вид члена %d не поддерживается (%s)" % (k, member))
+        raise PatchError("член %s не найден" % member)
+
+    def add_class_field(self, cls, name, type_idx):
+        """добавить поле (вид 5) в конец класса этого модуля (только для классов без
+        своих методов, чтобы слоты методов не сдвигались). -> слот"""
+        ci = self.class_index(cls)
+        rec = pb_parse(self.classes_raw[ci])
+        members = [pb_parse(v) for f, v in rec if f == 3]
+        for m in members:
+            if self.all_strings()[pb_first(m, 1)] == name:
+                return pb_first(m, 2)
+        if any(pb_first(m, 3) in (1, 2, 3) for m in members):
+            raise PatchError("в класс %s нельзя добавить поле: у него есть методы" % cls)
+        fields = [m for m in members if pb_first(m, 3) == 5]
+        if not fields:
+            raise PatchError("в классе %s нет полей-образцов" % cls)
+        slot = max(pb_first(m, 2) for m in members) + 1
+        attr = pb_first(fields[-1], 7, b"")
+        entry = pb_build([(1, self.string(name)), (2, slot), (3, 5), (7, attr),
+                          (8, msg((1, type_idx), (2, 0)))])
+        last = max(i for i, (f, v) in enumerate(rec) if f == 3)
+        rec.insert(last + 1, (3, entry))
+        self.classes_raw[ci] = pb_build(rec)
+        self.class_updates.add(ci)
+        return slot
 
     # внешние символы
     def ext_type_names(self):
@@ -411,6 +454,18 @@ class ModEditor:
     def const_type(self, i, tidx):
         return self.add_func_const(i, msg((1, 5), (6, tidx)))
 
+    def const_int(self, i, v):
+        """целая константа (так записываются номера слотов событий для 10/11)"""
+        return self.add_func_const(i, msg((1, 1), (2, v)))
+
+    def const_float(self, i, v):
+        # поле 4 - fixed32 (тип 5), как у констант игры
+        return self.add_func_const(i, msg((1, 3), (4, ("raw", b"\x25" + struct.pack("<f", v)))))
+
+    def const_method_ref(self, i):
+        """ссылка «метод объекта» для создания делегата (14)"""
+        return self.add_func_const(i, msg((1, 6), (7, 0)))
+
     def set_func_code(self, i, instrs):
         fl = self.func_fields(i)
         code = encode_code(instrs)
@@ -422,11 +477,14 @@ class ModEditor:
     # сборка
     def body(self):
         out = []
-        fi = 0
+        fi = ci = 0
         for f, v in self.fields:
             if f == 8:
                 out.append((8, self.func_updates.get(fi, v)))
                 fi += 1
+            elif f == 7:
+                out.append((7, self.classes_raw[ci] if ci in self.class_updates else v))
+                ci += 1
             elif f == 4 and self.dirty_ext:
                 out.append((4, pb_build(self.ext)))
             else:
@@ -475,15 +533,26 @@ def import_type(dst, src, ti):
         inner = [(1, import_type(dst, src, pb_first(d, 1))), (2, dst.string(S[pb_first(d, 2)])),
                  (3, dst.ext_type(names[pb_first(d, 3)]))]
         return dst.add_type(msg((1, 5), (8, pb_build(inner))))
+    if k == 2:   # делегат: в модуле-приёмнике такой же объявляется по сигнатуре
+        d = pb_parse(pb_first(t, 7))
+        name = S[pb_first(d, 2)]
+        found = dst.find_type(name)
+        if found is not None and pb_first(pb_parse(dst.all_types()[found]), 1) == 2:
+            return found
+        inner = [(1, import_type(dst, src, pb_first(d, 1))), (2, dst.string(name)), (3, dst.string("")),
+                 (4, 0), (5, 0)]
+        return dst.add_type(msg((1, 2), (7, pb_build(inner))))
     raise PatchError("не удаётся перенести тип вида %s" % k)
 
 
-def ensure_member(dst, owner, member, decl):
+def ensure_member(dst, owner, member, decl, decl_cls=None):
     """Добавить в dst импорт члена owner.member (как это сделал бы компилятор).
-    decl - ModEditor модуля, где объявлен класс owner. Возвращает слот."""
-    ci = decl.class_index(owner)
+    decl - ModEditor модуля, где объявлен член (в классе decl_cls, по умолчанию owner).
+    Возвращает слот."""
+    dc = decl_cls or owner
+    ci = decl.class_index(dc)
     if ci is None:
-        raise PatchError("класс %s не найден в %s" % (owner, decl.name))
+        raise PatchError("класс %s не найден в %s" % (dc, decl.name))
     for name, slot, k, fidx in decl.class_members(ci):
         if name != member:
             continue
@@ -492,15 +561,17 @@ def ensure_member(dst, owner, member, decl):
             if e["slot"] == slot and S[e["name"]] == member and \
                     dst.type_name(e["owner"]).split("<")[0] == owner:
                 return slot
-        if k in (1, 2):
-            sig = import_type(dst, decl, decl.func_sig(fidx))
-        elif k == 4:
-            sig = import_type(dst, decl, fidx)
-        else:
+        t = decl.member_type(ci, member)
+        if k == 3:   # событие: в импорте - сигнатура делегата
+            td = pb_parse(decl.all_types()[t])
+            if pb_first(td, 1) == 2:
+                t = pb_first(pb_parse(pb_first(td, 7)), 1)
+        elif k not in (1, 2, 4, 5):
             raise PatchError("вид члена %d не поддерживается (%s)" % (k, member))
+        sig = import_type(dst, decl, t)
         dst.add_ext_member(k, member, dst.class_type(owner), slot, sig)
         return slot
-    raise PatchError("член %s.%s не найден в %s" % (owner, member, decl.name))
+    raise PatchError("член %s.%s не найден в %s" % (dc, member, decl.name))
 
 
 def ensure_global(dst, src, name):
@@ -797,6 +868,40 @@ class Assign(Expr):
         return self.e.emit() + [Ins(0x3B, self.k)]
 
 
+class Cast(Expr):
+    """приведение типа: k - константа функции с целевым типом"""
+    def __init__(self, e, k):
+        self.e, self.k = e, k
+
+    def emit(self):
+        return self.e.emit() + [Ins(0x35, self.k)]
+
+
+def FAdd(a, b): return Bin(0x21, a, b)
+def FSub(a, b): return Bin(0x25, a, b)
+def FMul(a, b): return Bin(0x28, a, b)
+def Concat(a, b): return Bin(0x22, a, b)
+def FLt(a, b): return Bin(0x32, a, b, 9)
+def FGt(a, b): return Bin(0x32, a, b, 10)
+def FLe(a, b): return Bin(0x32, a, b, 11)
+def FGe(a, b): return Bin(0x32, a, b, 12)
+
+
+class Delegate(Expr):
+    """делегат obj.метод(слот): nparams - число параметров метода, tconst - константа
+    с типом делегата, fnconst - константа-ссылка на метод, bound - привязанные аргументы"""
+    def __init__(self, obj, slot, nparams, tconst, fnconst, *bound):
+        self.obj, self.slot, self.nparams, self.tconst, self.fnconst, self.bound = \
+            obj, slot, nparams, tconst, fnconst, bound
+
+    def emit(self):
+        out = []
+        for b in self.bound:
+            out += b.emit()
+        return out + [Ins(0x04, len(self.bound)), Ins(0x06, self.fnconst), Ins(0x04, self.nparams),
+                      Ins(0x04, self.slot)] + self.obj.emit() + [Ins(0x14, self.tconst)]
+
+
 class RawExpr(Expr):
     def __init__(self, items):
         self.items = list(items)
@@ -844,6 +949,24 @@ class Do(Stmt):
 
     def emit(self):
         return self.e.emit() + [Ins(0x02)]
+
+
+class Subscribe(Stmt):
+    """obj.событие += делегат; k - константа функции с номером слота события"""
+    def __init__(self, obj, k, delegate):
+        self.obj, self.k, self.delegate = obj, k, delegate
+
+    def emit(self):
+        return self.obj.emit() + self.delegate.emit() + [Ins(0x10, self.k), Ins(0x02)]
+
+
+class Unsubscribe(Stmt):
+    """отписать все делегаты объекта subscriber от события obj (как в коде игры)"""
+    def __init__(self, subscriber, obj, k):
+        self.subscriber, self.obj, self.k = subscriber, obj, k
+
+    def emit(self):
+        return self.subscriber.emit() + self.obj.emit() + [Ins(0x11, self.k), Ins(0x03), Ins(0x02)]
 
 
 class ArrAdd(Stmt):
