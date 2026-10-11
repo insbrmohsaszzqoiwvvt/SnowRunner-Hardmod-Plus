@@ -91,6 +91,11 @@ WHEEL_MARKER_ID = "hmp_wheel_marker"
 SAME_AXLE = 0.3             # колёса ближе 0.3 м по длине машины - на одной оси
 ARROW_SCALE = 60.0          # стрелки колёс меньше стрелок переключателя цели (масштаб в
                             # процентах, как scaleX в игре: 100 - обычный размер)
+# стрелки колёс сдвинуты от колонок стрелок «Цели» внутрь, к краям строки, на эту долю
+# расстояния между стрелками «Цели»; по высоте - центр стрелки на центре текста строки
+# плюс доля высоты стрелки (подобрано по скриншоту окна)
+ARROW_INSET = 0.0625
+ARROW_DROP = 0.1
 # новые поля данных окна (PopupRepairUiViewData2)
 F_ORDER, F_PREV, F_NEXT = "hmpWheelOrder", "hmpPrevArrow", "hmpNextArrow"
 
@@ -578,7 +583,9 @@ class WheelCtx:
         self.red = imp("UiTextColors", "redColor", TEXT_COLORS)
         self.white = imp("UiTextColors", "whiteColor", TEXT_COLORS)
         self.color_eq = imp("Color", "IsEqual", COLOR)
-        self.ct_setup = imp("UiColorTransform", "SetupColorTransform", GFX)
+        # умножение цвета (как подкрашивает значки игра): белый рисунок колеса
+        # окрашивается, тёмный кружок под ним остаётся как есть
+        self.ct_setup = imp("UiColorTransform", "SetupMultiplyer", GFX)
         self.color_tf = imp("UiDisplayObjectBase", "colorTransform", GFX)
         self.is_html = imp("UiLabel", "isHtml", GFX)
         self.g_html = ensure_global(m, ed[REPAIR_VIEW], "HtmlColorText")
@@ -1129,12 +1136,14 @@ def wheel_view_hint(vc, wv, fp, fi):
     lst = lambda: Field(THIS, vc.list)
     rv = lambda: Field(THIS, vc.repair_view)
     d, row_item, i, n, it, pos2, ry = (fp.new_local() for _ in range(7))
-    show, a, hdr, ppos, npos = (fp.new_local() for _ in range(5))
+    show, a, hdr, ppos, npos, dx = (fp.new_local() for _ in range(6))
     sw = lambda: Field(rv(), wv.switcher)
     pre, widx, _ = wheel_row_lookup(wv, fp, Call(lst(), wv.get_data), Local(d))
     wdata = fp.new_local()
     U = wv.ui
     half = Const(v.const_float(fi, 0.5))
+    inset = Const(v.const_float(fi, ARROW_INSET))
+    drop = Const(v.const_float(fi, ARROW_DROP))
     fx = lambda o, f: Field(o, U[f])
     body = [
         SetLocal(d, Field(THIS, vc.last)),
@@ -1152,8 +1161,8 @@ def wheel_view_hint(vc, wv, fp, fi):
                 ]),
             ]),
             If(Ne(Local(row_item), NULL), [
-                # по вертикали - по центру текста строки; по горизонтали - в тех же
-                # колонках, что стрелки переключателя цели (внутри окна, по бокам строк)
+                # по вертикали - по центру текста строки; по горизонтали - от колонок
+                # стрелок переключателя цели внутрь, вплотную к краям строки
                 SetLocal(hdr, Field(Local(row_item), wv.row_header)),
                 SetLocal(pos2, NULL),
                 If(Ne(Local(hdr), NULL), [
@@ -1163,13 +1172,14 @@ def wheel_view_hint(vc, wv, fp, fi):
                 If(And(Ne(Local(pos2), NULL), Ne(Local(ppos), NULL), Ne(Local(npos), NULL)), [
                     SetLocal(show, Bool(True)),
                     SetLocal(ry, FAdd(Field(Local(pos2), wv.vec_y), FMul(fx(Local(hdr), "height"), half))),
-                    # точка привязки стрелки - сверху: центрируем по высоте самой стрелки
+                    SetLocal(dx, FMul(FSub(Field(Local(npos), wv.vec_x), Field(Local(ppos), wv.vec_x)), inset)),
+                    # точка привязки стрелки - в её центре
                     SetLocal(a, Field(Local(d), wv.prev)),
-                    SetField(Local(a), U["x"], Field(Local(ppos), wv.vec_x)),
-                    SetField(Local(a), U["y"], FSub(Local(ry), FMul(fx(Local(a), "height"), half))),
+                    SetField(Local(a), U["x"], FAdd(Field(Local(ppos), wv.vec_x), Local(dx))),
+                    SetField(Local(a), U["y"], FAdd(Local(ry), FMul(fx(Local(a), "height"), drop))),
                     SetLocal(a, Field(Local(d), wv.next)),
-                    SetField(Local(a), U["x"], Field(Local(npos), wv.vec_x)),
-                    SetField(Local(a), U["y"], FSub(Local(ry), FMul(fx(Local(a), "height"), half))),
+                    SetField(Local(a), U["x"], FSub(Field(Local(npos), wv.vec_x), Local(dx))),
+                    SetField(Local(a), U["y"], FAdd(Local(ry), FMul(fx(Local(a), "height"), drop))),
                 ]),
             ]),
             SetField(Field(Local(d), wv.prev), U["visible"], Local(show)),
