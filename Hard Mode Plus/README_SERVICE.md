@@ -138,6 +138,10 @@ headlights_follow_player = 60
 у игрока остаются включёнными. В первом грузовике после запуска игры фары
 остаются такими, какими были в сохранении.
 
+Сама игра гасит фары обоих грузовиков через мгновение после пересадки. Патч в
+течение 6 секунд после пересадки несколько раз включает их снова, поэтому сразу
+после пересадки фары могут на миг погаснуть и загореться (со щелчком).
+
 ## Ограничения
 
 * В сетевой игре (кооператив) патчи окна ремонта отключаются: игра там
@@ -204,7 +208,7 @@ headlights_follow_player = 60
   инструкций, номера слотов берутся из объявлений классов игры, поэтому после
   обновления игры патч либо применится, либо остановится с понятной ошибкой.
   Импорты чужих методов добавляются в модуль так, как это сделал бы компилятор.
-* Изменяются шесть модулей:
+* Изменяются семь модулей:
   `ui.components.popups.repair.popup_repair_ui_controller_new` (окно ремонта:
   UpdateNearTrucks, IsCanBeShown, SwitchSource, SwitchTarget, RepairAll,
   RepairPart, IsRepairEnabled, CreateData, CreateMarkers, GetRepairTruckMarker,
@@ -217,16 +221,24 @@ headlights_follow_player = 60
   AcceptPackWarning), `ui.components.popups.cargo.popup_cargo_loading_ui_controller`
   (окно погрузки: InitContent, TryShowCargoPreview, Action),
   `game.truck_manager.truck_input_controller` (управление грузовиком:
-  SetActiveTruck, UpdateTruckStickersMaterial).
+  SetActiveTruck, UpdateTruckStickersMaterial) и `game.truck_legacy_parameters`
+  (два поля в `TruckState`).
 * Фары: состояние фар игрока — поле `currHeadLightsOn` контроллера управления.
   В `SetActiveTruck` игра записывает в него состояние нового грузовика; патч
   запоминает прежнее значение и прежний грузовик, без грузовика поле не
-  сбрасывает, а новому грузовику ставит фары игрока через `SetLights`. Покинутому
-  грузовику фары снова включаются и через `AsyncScheduler.Delay` ставится задача
-  `UpdateTruckStickersMaterial(покинутый)`. Этот метод игра вызывает только для
-  нового текущего грузовика, поэтому для другого грузовика он теперь гасит фары,
-  если тот ещё есть в `TrucksManager.GetAllTrucks()` (удалённый грузовик не
-  трогается). Новых полей в классах нет.
+  сбрасывает, а новому грузовику ставит фары игрока через `SetLights`. Игра
+  гасит фары обоих грузовиков не в момент пересадки, а чуть позже, поэтому через
+  `AsyncScheduler.Delay` ставятся задачи (через 0,15–6 с) — вызовы
+  `UpdateTruckStickersMaterial(грузовик)`. Единственный вызов этого метода в игре
+  (из `SetActiveTruck`) заменён прямым `truck.UpdateTruckStickersMaterial()`, и
+  метод теперь занят фарами: текущему грузовику он снова включает фары, если они
+  включены у игрока, покинутому — держит их включёнными, а последняя задача
+  покинутого (через `headlights_follow_player` секунд) их гасит. Фары включаются
+  выключением и включением в одном кадре: если они и так горят, щелчка нет. У
+  каждого грузовика в `TruckState` (`game.truck_legacy_parameters`) два новых
+  поля: число его несработавших задач (`hmpLightsTasks`) и «держать фары»
+  (`hmpLightsKeep`, покинут с включёнными фарами). Удалённый грузовик (нет в
+  `TrucksManager.GetAllTrucks()`) не трогается.
 * Цена погрузки: в `InitContent` игра считает `autoLoadPrice =
   GetAutoloadPrice() * GetLoadingPriceFactor()`. Вместо `GetAutoloadPrice()`
   (150 в Сложном режиме, 0 в обычном) подставляется цена из настроек, если
